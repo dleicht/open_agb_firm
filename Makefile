@@ -30,20 +30,12 @@ export VERS_MINOR  := $(shell echo "$(VERS_STRING)" | sed 's/.*\.\([0-9]*\).*/\1
 NPROC := $(shell nproc)
 
 
-.PHONY: checkarm9 checkarm11 clean release
+.PHONY: clean release
 
 #---------------------------------------------------------------------------------
 # main targets
 #---------------------------------------------------------------------------------
-all: checkarm9 checkarm11 $(TARGET).firm
-
-#---------------------------------------------------------------------------------
-checkarm9:
-	@$(MAKE) -j$(NPROC) --no-print-directory -C arm9
-
-#---------------------------------------------------------------------------------
-checkarm11:
-	@$(MAKE) -j$(NPROC) --no-print-directory -C arm11
+all: $(TARGET).firm
 
 #---------------------------------------------------------------------------------
 $(TARGET).firm: arm9/$(TARGET)9.bin arm11/$(TARGET)11.bin
