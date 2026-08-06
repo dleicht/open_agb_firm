@@ -223,6 +223,24 @@ void patchGbaGpuCmdList(const u8 scaleType, const bool useSecondTexture)
 		memcpy(&gbaGpuList2[316], &tmp, 4);
 		memcpy(&gbaGpuList2[380], &tmp, 4);
 	}
+	else if(scaleType == 3)
+	{
+		// Stretch the matrix-scaled 360x240 image horizontally to the full
+		// 400x240 top-screen framebuffer. The vertex attributes use PICA200
+		// float24 values stored as three little-endian bytes.
+		const u32 xLeft  = 0x000000; //   0.0f
+		const u32 xRight = 0x479000; // 400.0f
+
+		memcpy(&gbaGpuInitList[956],  &xLeft,  3);
+		memcpy(&gbaGpuInitList[988],  &xRight, 3);
+		memcpy(&gbaGpuInitList[1020], &xLeft,  3);
+		memcpy(&gbaGpuInitList[1052], &xRight, 3);
+
+		memcpy(&gbaGpuList2[268], &xLeft,  3);
+		memcpy(&gbaGpuList2[300], &xRight, 3);
+		memcpy(&gbaGpuList2[332], &xLeft,  3);
+		memcpy(&gbaGpuList2[364], &xRight, 3);
+	}
 	// else nothing to do.
 
 	flushDCacheRange(gbaGpuInitList, sizeof(gbaGpuInitList));
