@@ -159,6 +159,8 @@ static int cfgIniCallback(void *user, const char *section, const char *name, con
 				config->scaler = 1;
 			else if(strcmp(value, "matrix") == 0)
 				config->scaler = 2;
+			else if(strcmp(value, "stretch") == 0)
+				config->scaler = 3;
 		}
 		else if(strcmp(name, "colorProfile") == 0)
 		{
