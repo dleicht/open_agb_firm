@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "types.h"
+#include "drivers/cache.h"
 #include "util.h"
 #include "arm11/fast_rom_padding.h"
 #include "oaf_error_codes.h"
@@ -41,8 +42,195 @@
 
 
 static KHandle g_frameReadyEvent = 0;
+static bool g_stage5SleepAvailable = false;
 
 
+#define STAGE5_GBA_ROM_BASE          0x08000000u
+#define STAGE5_BIOS_IRQ_HANDLER      0x00000128u
+#define STAGE5_EEPROM_RESERVED_OFF   0x01FFFF00u
+#define STAGE5_HANDLER_ALIGN         4u
+#define STAGE5_PAD_GUARD             0x40u
+
+typedef enum
+{
+	STAGE5_PLACE_NONE = 0,
+	STAGE5_PLACE_ROM_PADDING,
+	STAGE5_PLACE_OPEN_BUS_TAIL
+} Stage5PlacementKind;
+
+typedef struct
+{
+	u32 offset;
+	u32 spanStart;
+	u32 spanSize;
+	u8 fillByte;
+	Stage5PlacementKind kind;
+} Stage5Placement;
+
+static bool stage5IsEepromSave(const u16 saveType)
+{
+	const u16 type = saveType & SAVE_TYPE_MASK;
+	return type == SAVE_TYPE_EEPROM_8k ||
+	       type == SAVE_TYPE_EEPROM_8k_2 ||
+	       type == SAVE_TYPE_EEPROM_64k ||
+	       type == SAVE_TYPE_EEPROM_64k_2;
+}
+
+static bool stage5RangeFits(const u32 offset, const u32 size, const u32 limit)
+{
+	return offset <= limit && size <= limit - offset;
+}
+
+static bool stage5FindHandlerPlacement(const u8 *const rom,
+                                       const u32 romSize,
+                                       const u32 handlerSize,
+                                       const u16 saveType,
+                                       Stage5Placement *const placementOut)
+{
+	if(rom == NULL || placementOut == NULL || handlerSize == 0 ||
+	   romSize == 0 || romSize > LGY_MAX_ROM_SIZE ||
+	   handlerSize > LGY_MAX_ROM_SIZE)
+		return false;
+
+	placementOut->offset = 0;
+	placementOut->spanStart = 0;
+	placementOut->spanSize = 0;
+	placementOut->fillByte = 0;
+	placementOut->kind = STAGE5_PLACE_NONE;
+
+	if(handlerSize > LGY_MAX_ROM_SIZE - STAGE5_PAD_GUARD * 2u)
+		return false;
+
+	const bool eeprom = stage5IsEepromSave(saveType);
+	u32 searchEnd = romSize;
+	if(eeprom && searchEnd > STAGE5_EEPROM_RESERVED_OFF)
+		searchEnd = STAGE5_EEPROM_RESERVED_OFF;
+
+	/*
+	 * First choice: same policy as proven V5.
+	 * Find homogeneous 0x00/0xFF runs and keep the highest-address safe
+	 * candidate. Guards on both sides remain exactly 0x40 bytes.
+	 */
+	bool found = false;
+	u32 bestOffset = 0;
+	u32 bestRunStart = 0;
+	u32 bestRunSize = 0;
+	u8 bestFill = 0;
+
+	if(searchEnd > 0)
+	{
+		u32 runStart = 0;
+		u8 runFill = rom[0];
+		const u32 required = handlerSize + STAGE5_PAD_GUARD * 2u;
+
+		for(u32 i = 1; i <= searchEnd; i++)
+		{
+			const bool runEnded = (i == searchEnd || rom[i] != runFill);
+			if(!runEnded)
+				continue;
+
+			const u32 runLen = i - runStart;
+			if((runFill == 0x00u || runFill == 0xFFu) && runLen >= required)
+			{
+				u32 candidate = i - STAGE5_PAD_GUARD - handlerSize;
+				candidate &= ~(STAGE5_HANDLER_ALIGN - 1u);
+
+				if(candidate >= runStart + STAGE5_PAD_GUARD &&
+				   stage5RangeFits(candidate, handlerSize, i - STAGE5_PAD_GUARD))
+				{
+					bestOffset = candidate;
+					bestRunStart = runStart;
+					bestRunSize = runLen;
+					bestFill = runFill;
+					found = true;
+				}
+			}
+
+			if(i < searchEnd)
+			{
+				runStart = i;
+				runFill = rom[i];
+			}
+		}
+	}
+
+	if(found)
+	{
+		placementOut->offset = bestOffset;
+		placementOut->spanStart = bestRunStart;
+		placementOut->spanSize = bestRunSize;
+		placementOut->fillByte = bestFill;
+		placementOut->kind = STAGE5_PLACE_ROM_PADDING;
+		return true;
+	}
+
+	/*
+	 * Second choice: same proven V5 fallback.
+	 * OAF owns the area after the virtual ROM/mirror and fills it with its
+	 * fake-open-bus pattern. 1 MiB carts occupy 4 MiB because of mirroring.
+	 */
+	u32 occupiedEnd = romSize;
+	if(occupiedEnd == 0x00100000u)
+		occupiedEnd = 0x00400000u;
+
+	u32 tailEnd = LGY_MAX_ROM_SIZE;
+	if(eeprom && tailEnd > STAGE5_EEPROM_RESERVED_OFF)
+		tailEnd = STAGE5_EEPROM_RESERVED_OFF;
+
+	if(occupiedEnd > tailEnd)
+		return false;
+
+	const u32 candidate = (occupiedEnd + STAGE5_HANDLER_ALIGN - 1u) &
+	                      ~(STAGE5_HANDLER_ALIGN - 1u);
+	if(stage5RangeFits(candidate, handlerSize, tailEnd))
+	{
+		placementOut->offset = candidate;
+		placementOut->spanStart = occupiedEnd;
+		placementOut->spanSize = tailEnd - occupiedEnd;
+		placementOut->fillByte = 0;
+		placementOut->kind = STAGE5_PLACE_OPEN_BUS_TAIL;
+		return true;
+	}
+
+	return false;
+}
+
+static bool stage5ValidatePlacement(const u8 *const rom,
+                                    const u32 handlerSize,
+                                    const Stage5Placement *const placement)
+{
+	if(rom == NULL || placement == NULL || placement->kind == STAGE5_PLACE_NONE)
+		return false;
+	if(!stage5RangeFits(placement->offset, handlerSize, LGY_MAX_ROM_SIZE))
+		return false;
+	if((placement->offset & (STAGE5_HANDLER_ALIGN - 1u)) != 0)
+		return false;
+
+	if(placement->kind == STAGE5_PLACE_ROM_PADDING)
+	{
+		if(placement->fillByte != 0x00u && placement->fillByte != 0xFFu)
+			return false;
+		if(!stage5RangeFits(placement->spanStart, placement->spanSize,
+		                    LGY_MAX_ROM_SIZE))
+			return false;
+		if(placement->offset < placement->spanStart + STAGE5_PAD_GUARD)
+			return false;
+		if(!stage5RangeFits(placement->offset, handlerSize,
+		                    placement->spanStart + placement->spanSize - STAGE5_PAD_GUARD))
+			return false;
+
+		// Re-check the exact bytes we are about to replace.
+		for(u32 i = 0; i < handlerSize; i++)
+			if(rom[placement->offset + i] != placement->fillByte)
+				return false;
+	}
+	else if(placement->kind != STAGE5_PLACE_OPEN_BUS_TAIL)
+	{
+		return false;
+	}
+
+	return true;
+}
 
 static u32 fixRomPadding(const u32 romFileSize)
 {
@@ -318,11 +506,105 @@ Result oafInitAndRun(void)
 				saveType = detectSaveType(romSize, g_oafConfig.defaultSave);
 
 			patchRom(romFilePath, &romSize);
+
+			/*
+			 * Stage-5 V5.1 universal manual GBA Sleep/Wake.
+			 *
+			 * Persistent ARM7 vector 0x18 enters this handler BEFORE the
+			 * normal GBA BIOS IRQ routine. V4 inspects KEYINPUT only through
+			 * FIQ-banked registers; normal IRQs touch no game registers and
+			 * use no IRQ stack before chaining to BIOS 0x128.
+			 *
+			 * Manual controls:
+			 *   L + Select -> real GBA STOP
+			 *   R + Select -> wake
+			 *
+			 * Handler address is selected at runtime from validated ROM padding or
+			 * OAF's fake-open-bus tail. EEPROM offset 0x01FFFF00..0x01FFFFFF is never used.
+			 */
+			static const u8 stage5IrqHandler[] =
+			{
+				0xD1, 0xF0, 0x21, 0xE3, 0xDC, 0x80, 0x9F, 0xE5, 0xB0, 0x90, 0xD8, 0xE1,
+				0x81, 0xAF, 0xA0, 0xE3, 0x0A, 0x00, 0x19, 0xE1, 0x01, 0x00, 0x00, 0x0A,
+				0x92, 0xF0, 0x21, 0xE3, 0x4A, 0xFF, 0xA0, 0xE3, 0x92, 0xF0, 0x21, 0xE3,
+				0x0F, 0x50, 0x2D, 0xE9, 0xF0, 0x0F, 0x2D, 0xE9, 0x01, 0x03, 0xA0, 0xE3,
+				0x60, 0x10, 0x80, 0xE2, 0xFC, 0x03, 0xB1, 0xE8, 0xFC, 0x03, 0x2D, 0xE9,
+				0xFC, 0x03, 0xB1, 0xE8, 0xFC, 0x03, 0x2D, 0xE9, 0x9C, 0x70, 0x9F, 0xE5,
+				0x9C, 0x80, 0x9F, 0xE5, 0x9C, 0x90, 0x9F, 0xE5, 0xB0, 0x40, 0xD8, 0xE1,
+				0xB0, 0x50, 0xD9, 0xE1, 0xB0, 0x60, 0xD0, 0xE1, 0x90, 0x10, 0x9F, 0xE5,
+				0x00, 0x10, 0x88, 0xE5, 0x8C, 0x10, 0x9F, 0xE5, 0xB0, 0x10, 0xC9, 0xE1,
+				0x00, 0x10, 0xA0, 0xE3, 0xB4, 0x18, 0xC0, 0xE1, 0x80, 0x10, 0x86, 0xE3,
+				0xB0, 0x10, 0xC0, 0xE1, 0x00, 0x00, 0x03, 0xEF, 0x41, 0x2F, 0xA0, 0xE3,
+				0xB0, 0x10, 0xD7, 0xE1, 0x02, 0x00, 0x11, 0xE1, 0xFC, 0xFF, 0xFF, 0x1A,
+				0xB0, 0x10, 0xD7, 0xE1, 0x02, 0x30, 0x01, 0xE0, 0x02, 0x00, 0x53, 0xE1,
+				0xFB, 0xFF, 0xFF, 0x1A, 0xB0, 0x40, 0xC8, 0xE1, 0xB0, 0x50, 0xC9, 0xE1,
+				0x01, 0x1A, 0xA0, 0xE3, 0xB2, 0x10, 0xC8, 0xE1, 0xB0, 0x60, 0xC0, 0xE1,
+				0xFC, 0x03, 0xBD, 0xE8, 0x84, 0x30, 0x80, 0xE5, 0x80, 0x10, 0x80, 0xE2,
+				0xFC, 0x03, 0xA1, 0xE8, 0x60, 0x10, 0x80, 0xE2, 0xFC, 0x03, 0xBD, 0xE8,
+				0xFC, 0x03, 0xA1, 0xE8, 0xF0, 0x0F, 0xBD, 0xE8, 0xB6, 0x10, 0xD0, 0xE1,
+				0xA0, 0x00, 0x51, 0xE3, 0xFC, 0xFF, 0xFF, 0x1A, 0x0F, 0x50, 0xBD, 0xE8,
+				0x04, 0xF0, 0x5E, 0xE2, 0x30, 0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x04,
+				0x32, 0x01, 0x00, 0x04, 0x00, 0x30, 0xFF, 0xFF, 0x04, 0xC1, 0x00, 0x00,
+			};
+			Stage5Placement stage5Placement;
+			u32 stage5HandlerGbaAddr = STAGE5_BIOS_IRQ_HANDLER;
+			if(stage5FindHandlerPlacement((const u8*)LGY_ROM_LOC,
+			                              romSize,
+			                              sizeof(stage5IrqHandler),
+			                              saveType,
+			                              &stage5Placement) &&
+			   stage5ValidatePlacement((const u8*)LGY_ROM_LOC,
+			                           sizeof(stage5IrqHandler),
+			                           &stage5Placement))
+			{
+				memcpy((void*)(LGY_ROM_LOC + stage5Placement.offset),
+				       stage5IrqHandler, sizeof(stage5IrqHandler));
+
+				// Make the injected ARM code visible to the LGY/ARM7 side explicitly.
+				flushDCacheRange((void*)(LGY_ROM_LOC + stage5Placement.offset),
+				                 sizeof(stage5IrqHandler));
+
+				stage5HandlerGbaAddr = STAGE5_GBA_ROM_BASE + stage5Placement.offset;
+#ifndef NDEBUG
+				if(stage5Placement.kind == STAGE5_PLACE_ROM_PADDING)
+				{
+					ee_printf("Stage-5 V5.1: handler @ %08lX ROM+%08lX pad=%02X run=%08lX+%08lX\n",
+					          (unsigned long)stage5HandlerGbaAddr,
+					          (unsigned long)stage5Placement.offset,
+					          (unsigned)stage5Placement.fillByte,
+					          (unsigned long)stage5Placement.spanStart,
+					          (unsigned long)stage5Placement.spanSize);
+				}
+				else
+				{
+					ee_printf("Stage-5 V5.1: handler @ %08lX ROM+%08lX source=open-bus-tail\n",
+					          (unsigned long)stage5HandlerGbaAddr,
+					          (unsigned long)stage5Placement.offset);
+				}
+#endif
+			}
+			else
+			{
+				// Transparent fallback: normal BIOS IRQ path, Sleep/Wake disabled.
+				ee_puts("Stage-5 V5.1: no validated handler location; Sleep/Wake disabled.");
+			}
 			free(romFilePath);
 
 			// Set audio output and volume.
 			CODEC_setAudioOutput(g_oafConfig.audioOut);
 			CODEC_setVolumeOverride(g_oafConfig.volume);
+
+			// Stage-5 V5.1: select vector slot 0x14 before ARM9 builds the overlay.
+			// ARM9 defaults to BIOS 0x128 and also resets to it after each prepare.
+			g_stage5SleepAvailable = false;
+			res = LGY_setGbaIrqHandlerAddress(stage5HandlerGbaAddr);
+			if(res != RES_OK)
+			{
+				ee_puts("Stage-5 V5.1: vector target rejected; using BIOS IRQ fallback.");
+				stage5HandlerGbaAddr = STAGE5_BIOS_IRQ_HANDLER;
+			}
+			else if(stage5HandlerGbaAddr != STAGE5_BIOS_IRQ_HANDLER)
+				g_stage5SleepAvailable = true;
 
 			// Prepare ARM9 for GBA mode + save loading.
 			res = LGY_prepareGbaMode(g_oafConfig.directBoot, saveType, filePath);
@@ -351,6 +633,11 @@ Result oafInitAndRun(void)
 	return res;
 }
 
+bool oafStage5SleepAvailable(void)
+{
+	return g_stage5SleepAvailable;
+}
+
 void oafUpdate(void)
 {
 	const u32 *const maps = g_oafConfig.buttonMaps;
@@ -371,6 +658,7 @@ void oafUpdate(void)
 
 void oafFinish(void)
 {
+	g_stage5SleepAvailable = false;
 	// frameReadyEvent deleted by this function.
 	OAF_videoExit();
 	g_frameReadyEvent = 0;
