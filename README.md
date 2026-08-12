@@ -1,3 +1,22 @@
+# Universal GBA Sleep/Wake fork
+
+This fork adds hardware GBA Sleep/Wake support to open_agb_firm.
+
+# Features:
+- real GBA BIOS SWI 03h / STOP
+- universal pre-BIOS IRQ handler
+- dynamic per-ROM handler placement
+- EEPROM-safe handler allocation
+- manual L+Select Sleep / R+Select Wake
+- automatic lid-close Sleep / lid-open Wake
+- N3DS display/audio/power LED sleep integration
+
+Based on profi200/open_agb_firm. Licensed under GPL-3.0-or-later.
+
+Original README.md below:
+
+--------
+
 # open_agb_firm
 open_agb_firm is a bare metal interface for *natively* running GBA games and homebrew using the 3DS's built-in GBA hardware.
 
