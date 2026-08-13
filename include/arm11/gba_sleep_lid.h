@@ -1,6 +1,6 @@
 #pragma once
 /*
- * Stage-5 V5.1 automatic lid Sleep/Wake integration.
+ * Automatic lid integration for universal GBA Sleep/Wake support.
  */
 
 #ifdef __cplusplus
@@ -8,7 +8,7 @@ extern "C"
 {
 #endif
 
-void stage5HandleLid(void);
+void gbaSleepHandleLid(void);
 
 #ifdef __cplusplus
 } // extern "C"

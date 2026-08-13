@@ -30,7 +30,7 @@ extern "C"
 Result oafParseConfigEarly(void);
 void changeBacklight(s16 amount);
 Result oafInitAndRun(void);
-bool oafStage5SleepAvailable(void);
+bool oafIsGbaSleepAvailable(void);
 void oafUpdate(void);
 void oafFinish(void);
 

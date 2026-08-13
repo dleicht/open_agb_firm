@@ -1,22 +1,22 @@
 /*
- * Stage-5 V5.1 automatic lid Sleep/Wake integration for open_agb_firm.
+ * Automatic lid integration for universal GBA Sleep/Wake support.
  *
  * Lid Close:
- *   GBA L+Select -> Stage-5 handler -> real SWI 03h / STOP
+ *   GBA L+Select -> GBA Sleep IRQ handler -> real SWI 03h / STOP
  *   then N3DS audio/capture/backlights off + sleep power LED
  *
  * Lid Open:
- *   GBA R+Select + LGY wake/ack -> Stage-5 handler resumes
+ *   GBA R+Select + LGY wake/ack -> GBA Sleep IRQ handler resumes
  *   then N3DS presentation is restored
  *
- * This module does not modify or replace the Stage-5 ARM handler.
+ * This module does not modify or replace the GBA Sleep IRQ handler.
  */
 #include "arm.h"
 #include "types.h"
 #include "drivers/gfx.h"
 #include "arm11/config.h"
 #include "arm11/open_agb_firm.h"
-#include "arm11/stage5_lid.h"
+#include "arm11/gba_sleep_lid.h"
 #include "arm11/drivers/codec.h"
 #include "arm11/drivers/gpio.h"
 #include "arm11/drivers/hid.h"
@@ -24,12 +24,12 @@
 #include "arm11/drivers/lgy11.h"
 #include "arm11/drivers/mcu.h"
 
-#define STAGE5_GBA_SLEEP_BUTTONS  0x0204u  // L + Select.
-#define STAGE5_GBA_WAKE_BUTTONS   0x0104u  // R + Select.
+#define GBA_SLEEP_BUTTONS  0x0204u  // L + Select.
+#define GBA_WAKE_BUTTONS   0x0104u  // R + Select.
 
-void stage5HandleLid(void)
+void gbaSleepHandleLid(void)
 {
-	if(!oafStage5SleepAvailable())
+	if(!oafIsGbaSleepAvailable())
 		return;
 
 	Lgy11 *const lgy11 = getLgy11Regs();
@@ -37,17 +37,17 @@ void stage5HandleLid(void)
 	const u16 oldPadSel = lgy11->pad_sel;
 	const u16 oldPadVal = lgy11->pad_val;
 	const u16 injectedButtons =
-		STAGE5_GBA_SLEEP_BUTTONS | STAGE5_GBA_WAKE_BUTTONS;
+		GBA_SLEEP_BUTTONS | GBA_WAKE_BUTTONS;
 
 	/*
 	 * Lid close: inject the same L+Select combination that works manually.
-	 * The Stage-5 handler then enters real GBA SWI 03h / STOP.
+	 * The GBA Sleep IRQ handler then enters real GBA SWI 03h / STOP.
 	 */
 	lgy11->pad_sel = oldPadSel | injectedButtons;
-	LGY11_setInputState(STAGE5_GBA_SLEEP_BUTTONS);
+	LGY11_setInputState(GBA_SLEEP_BUTTONS);
 
 	/*
-	 * Previously hardware-tested N3DS-side sequence.
+	 * Suspend the N3DS presentation only after the GBA STOP trigger is injected.
 	 * The GBA STOP request is injected before presentation is suspended.
 	 */
 	CODEC_setVolumeOverride(-128);
@@ -61,12 +61,12 @@ void stage5HandleLid(void)
 	/*
 	 * Lid open: present R+Select first, then wake/ack LGY.
 	 */
-	LGY11_setInputState(STAGE5_GBA_WAKE_BUTTONS);
+	LGY11_setInputState(GBA_WAKE_BUTTONS);
 	REG_HID_PADCNT = 0;
 	lgy11->sleep |= (u16)(BIT(0) | BIT(1));
 
 	/*
-	 * Hardware-tested timing from the earlier Lid implementation.
+	 * Keep the synthetic wake combination asserted for one VBlank.
 	 */
 	GFX_waitForVBlank0();
 
