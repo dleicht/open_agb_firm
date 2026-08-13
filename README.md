@@ -93,7 +93,8 @@ Video-related settings.
 
 `string scaler` - Video scaler.
 * Default: `matrix`
-* Options: `none`, `bilinear`, `matrix`
+* Options: `none`, `bilinear`, `matrix`, `stretch`
+  * `stretch` uses the matrix scaler and stretches the resulting 360x240 image horizontally to fill the complete 400x240 top screen. This changes the original GBA aspect ratio.
 
 `string colorProfile` - Color correction profile.
 * Default: `none`
