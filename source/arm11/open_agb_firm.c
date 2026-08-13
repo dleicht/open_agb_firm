@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "types.h"
+#include "drivers/cache.h"
 #include "util.h"
 #include "arm11/fast_rom_padding.h"
 #include "oaf_error_codes.h"
@@ -41,8 +42,195 @@
 
 
 static KHandle g_frameReadyEvent = 0;
+static bool g_gbaSleepAvailable = false;
 
 
+#define GBA_SLEEP_HANDLER_ROM_BASE          0x08000000u
+#define GBA_SLEEP_BIOS_IRQ_HANDLER      0x00000128u
+#define GBA_SLEEP_EEPROM_RESERVED_OFF   0x01FFFF00u
+#define GBA_SLEEP_HANDLER_ALIGN         4u
+#define GBA_SLEEP_HANDLER_PAD_GUARD             0x40u
+
+typedef enum
+{
+	GBA_SLEEP_PLACE_NONE = 0,
+	GBA_SLEEP_PLACE_ROM_PADDING,
+	GBA_SLEEP_PLACE_OPEN_BUS_TAIL
+} GbaSleepHandlerPlacementKind;
+
+typedef struct
+{
+	u32 offset;
+	u32 spanStart;
+	u32 spanSize;
+	u8 fillByte;
+	GbaSleepHandlerPlacementKind kind;
+} GbaSleepHandlerPlacement;
+
+static bool isEepromSaveType(const u16 saveType)
+{
+	const u16 type = saveType & SAVE_TYPE_MASK;
+	return type == SAVE_TYPE_EEPROM_8k ||
+	       type == SAVE_TYPE_EEPROM_8k_2 ||
+	       type == SAVE_TYPE_EEPROM_64k ||
+	       type == SAVE_TYPE_EEPROM_64k_2;
+}
+
+static bool rangeFits(const u32 offset, const u32 size, const u32 limit)
+{
+	return offset <= limit && size <= limit - offset;
+}
+
+static bool findGbaSleepHandlerPlacement(const u8 *const rom,
+                                       const u32 romSize,
+                                       const u32 handlerSize,
+                                       const u16 saveType,
+                                       GbaSleepHandlerPlacement *const placementOut)
+{
+	if(rom == NULL || placementOut == NULL || handlerSize == 0 ||
+	   romSize == 0 || romSize > LGY_MAX_ROM_SIZE ||
+	   handlerSize > LGY_MAX_ROM_SIZE)
+		return false;
+
+	placementOut->offset = 0;
+	placementOut->spanStart = 0;
+	placementOut->spanSize = 0;
+	placementOut->fillByte = 0;
+	placementOut->kind = GBA_SLEEP_PLACE_NONE;
+
+	if(handlerSize > LGY_MAX_ROM_SIZE - GBA_SLEEP_HANDLER_PAD_GUARD * 2u)
+		return false;
+
+	const bool eeprom = isEepromSaveType(saveType);
+	u32 searchEnd = romSize;
+	if(eeprom && searchEnd > GBA_SLEEP_EEPROM_RESERVED_OFF)
+		searchEnd = GBA_SLEEP_EEPROM_RESERVED_OFF;
+
+	/*
+	 * First choice: validated padding inside the final loaded ROM.
+	 * Find homogeneous 0x00/0xFF runs and keep the highest-address safe
+	 * candidate. Guards on both sides remain exactly 0x40 bytes.
+	 */
+	bool found = false;
+	u32 bestOffset = 0;
+	u32 bestRunStart = 0;
+	u32 bestRunSize = 0;
+	u8 bestFill = 0;
+
+	if(searchEnd > 0)
+	{
+		u32 runStart = 0;
+		u8 runFill = rom[0];
+		const u32 required = handlerSize + GBA_SLEEP_HANDLER_PAD_GUARD * 2u;
+
+		for(u32 i = 1; i <= searchEnd; i++)
+		{
+			const bool runEnded = (i == searchEnd || rom[i] != runFill);
+			if(!runEnded)
+				continue;
+
+			const u32 runLen = i - runStart;
+			if((runFill == 0x00u || runFill == 0xFFu) && runLen >= required)
+			{
+				u32 candidate = i - GBA_SLEEP_HANDLER_PAD_GUARD - handlerSize;
+				candidate &= ~(GBA_SLEEP_HANDLER_ALIGN - 1u);
+
+				if(candidate >= runStart + GBA_SLEEP_HANDLER_PAD_GUARD &&
+				   rangeFits(candidate, handlerSize, i - GBA_SLEEP_HANDLER_PAD_GUARD))
+				{
+					bestOffset = candidate;
+					bestRunStart = runStart;
+					bestRunSize = runLen;
+					bestFill = runFill;
+					found = true;
+				}
+			}
+
+			if(i < searchEnd)
+			{
+				runStart = i;
+				runFill = rom[i];
+			}
+		}
+	}
+
+	if(found)
+	{
+		placementOut->offset = bestOffset;
+		placementOut->spanStart = bestRunStart;
+		placementOut->spanSize = bestRunSize;
+		placementOut->fillByte = bestFill;
+		placementOut->kind = GBA_SLEEP_PLACE_ROM_PADDING;
+		return true;
+	}
+
+	/*
+	 * Second choice: OAF's fake-open-bus tail.
+	 * OAF owns the area after the virtual ROM/mirror and fills it with its
+	 * fake-open-bus pattern. 1 MiB carts occupy 4 MiB because of mirroring.
+	 */
+	u32 occupiedEnd = romSize;
+	if(occupiedEnd == 0x00100000u)
+		occupiedEnd = 0x00400000u;
+
+	u32 tailEnd = LGY_MAX_ROM_SIZE;
+	if(eeprom && tailEnd > GBA_SLEEP_EEPROM_RESERVED_OFF)
+		tailEnd = GBA_SLEEP_EEPROM_RESERVED_OFF;
+
+	if(occupiedEnd > tailEnd)
+		return false;
+
+	const u32 candidate = (occupiedEnd + GBA_SLEEP_HANDLER_ALIGN - 1u) &
+	                      ~(GBA_SLEEP_HANDLER_ALIGN - 1u);
+	if(rangeFits(candidate, handlerSize, tailEnd))
+	{
+		placementOut->offset = candidate;
+		placementOut->spanStart = occupiedEnd;
+		placementOut->spanSize = tailEnd - occupiedEnd;
+		placementOut->fillByte = 0;
+		placementOut->kind = GBA_SLEEP_PLACE_OPEN_BUS_TAIL;
+		return true;
+	}
+
+	return false;
+}
+
+static bool validateGbaSleepHandlerPlacement(const u8 *const rom,
+                                    const u32 handlerSize,
+                                    const GbaSleepHandlerPlacement *const placement)
+{
+	if(rom == NULL || placement == NULL || placement->kind == GBA_SLEEP_PLACE_NONE)
+		return false;
+	if(!rangeFits(placement->offset, handlerSize, LGY_MAX_ROM_SIZE))
+		return false;
+	if((placement->offset & (GBA_SLEEP_HANDLER_ALIGN - 1u)) != 0)
+		return false;
+
+	if(placement->kind == GBA_SLEEP_PLACE_ROM_PADDING)
+	{
+		if(placement->fillByte != 0x00u && placement->fillByte != 0xFFu)
+			return false;
+		if(!rangeFits(placement->spanStart, placement->spanSize,
+		                    LGY_MAX_ROM_SIZE))
+			return false;
+		if(placement->offset < placement->spanStart + GBA_SLEEP_HANDLER_PAD_GUARD)
+			return false;
+		if(!rangeFits(placement->offset, handlerSize,
+		                    placement->spanStart + placement->spanSize - GBA_SLEEP_HANDLER_PAD_GUARD))
+			return false;
+
+		// Re-check the exact bytes we are about to replace.
+		for(u32 i = 0; i < handlerSize; i++)
+			if(rom[placement->offset + i] != placement->fillByte)
+				return false;
+	}
+	else if(placement->kind != GBA_SLEEP_PLACE_OPEN_BUS_TAIL)
+	{
+		return false;
+	}
+
+	return true;
+}
 
 static u32 fixRomPadding(const u32 romFileSize)
 {
@@ -318,11 +506,106 @@ Result oafInitAndRun(void)
 				saveType = detectSaveType(romSize, g_oafConfig.defaultSave);
 
 			patchRom(romFilePath, &romSize);
+
+			/*
+			 * Universal GBA Sleep/Wake support.
+			 *
+			 * Persistent ARM7 vector 0x18 enters the GBA Sleep IRQ handler before
+			 * the normal GBA BIOS IRQ routine. The normal IRQ fast path inspects
+			 * KEYINPUT only through FIQ-banked registers, touches no shared game
+			 * registers, and uses no IRQ stack before chaining to BIOS 0x128.
+			 *
+			 * Manual controls:
+			 *   L + Select -> real GBA STOP
+			 *   R + Select -> wake
+			 *
+			 * The handler address is selected at runtime from validated ROM padding
+			 * or OAF's fake-open-bus tail. EEPROM offset 0x01FFFF00..0x01FFFFFF
+			 * is never used.
+			 */
+			static const u8 gbaSleepIrqHandler[] =
+			{
+				0xD1, 0xF0, 0x21, 0xE3, 0xDC, 0x80, 0x9F, 0xE5, 0xB0, 0x90, 0xD8, 0xE1,
+				0x81, 0xAF, 0xA0, 0xE3, 0x0A, 0x00, 0x19, 0xE1, 0x01, 0x00, 0x00, 0x0A,
+				0x92, 0xF0, 0x21, 0xE3, 0x4A, 0xFF, 0xA0, 0xE3, 0x92, 0xF0, 0x21, 0xE3,
+				0x0F, 0x50, 0x2D, 0xE9, 0xF0, 0x0F, 0x2D, 0xE9, 0x01, 0x03, 0xA0, 0xE3,
+				0x60, 0x10, 0x80, 0xE2, 0xFC, 0x03, 0xB1, 0xE8, 0xFC, 0x03, 0x2D, 0xE9,
+				0xFC, 0x03, 0xB1, 0xE8, 0xFC, 0x03, 0x2D, 0xE9, 0x9C, 0x70, 0x9F, 0xE5,
+				0x9C, 0x80, 0x9F, 0xE5, 0x9C, 0x90, 0x9F, 0xE5, 0xB0, 0x40, 0xD8, 0xE1,
+				0xB0, 0x50, 0xD9, 0xE1, 0xB0, 0x60, 0xD0, 0xE1, 0x90, 0x10, 0x9F, 0xE5,
+				0x00, 0x10, 0x88, 0xE5, 0x8C, 0x10, 0x9F, 0xE5, 0xB0, 0x10, 0xC9, 0xE1,
+				0x00, 0x10, 0xA0, 0xE3, 0xB4, 0x18, 0xC0, 0xE1, 0x80, 0x10, 0x86, 0xE3,
+				0xB0, 0x10, 0xC0, 0xE1, 0x00, 0x00, 0x03, 0xEF, 0x41, 0x2F, 0xA0, 0xE3,
+				0xB0, 0x10, 0xD7, 0xE1, 0x02, 0x00, 0x11, 0xE1, 0xFC, 0xFF, 0xFF, 0x1A,
+				0xB0, 0x10, 0xD7, 0xE1, 0x02, 0x30, 0x01, 0xE0, 0x02, 0x00, 0x53, 0xE1,
+				0xFB, 0xFF, 0xFF, 0x1A, 0xB0, 0x40, 0xC8, 0xE1, 0xB0, 0x50, 0xC9, 0xE1,
+				0x01, 0x1A, 0xA0, 0xE3, 0xB2, 0x10, 0xC8, 0xE1, 0xB0, 0x60, 0xC0, 0xE1,
+				0xFC, 0x03, 0xBD, 0xE8, 0x84, 0x30, 0x80, 0xE5, 0x80, 0x10, 0x80, 0xE2,
+				0xFC, 0x03, 0xA1, 0xE8, 0x60, 0x10, 0x80, 0xE2, 0xFC, 0x03, 0xBD, 0xE8,
+				0xFC, 0x03, 0xA1, 0xE8, 0xF0, 0x0F, 0xBD, 0xE8, 0xB6, 0x10, 0xD0, 0xE1,
+				0xA0, 0x00, 0x51, 0xE3, 0xFC, 0xFF, 0xFF, 0x1A, 0x0F, 0x50, 0xBD, 0xE8,
+				0x04, 0xF0, 0x5E, 0xE2, 0x30, 0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x04,
+				0x32, 0x01, 0x00, 0x04, 0x00, 0x30, 0xFF, 0xFF, 0x04, 0xC1, 0x00, 0x00,
+			};
+			GbaSleepHandlerPlacement gbaSleepPlacement;
+			u32 gbaSleepHandlerGbaAddr = GBA_SLEEP_BIOS_IRQ_HANDLER;
+			if(findGbaSleepHandlerPlacement((const u8*)LGY_ROM_LOC,
+			                              romSize,
+			                              sizeof(gbaSleepIrqHandler),
+			                              saveType,
+			                              &gbaSleepPlacement) &&
+			   validateGbaSleepHandlerPlacement((const u8*)LGY_ROM_LOC,
+			                           sizeof(gbaSleepIrqHandler),
+			                           &gbaSleepPlacement))
+			{
+				memcpy((void*)(LGY_ROM_LOC + gbaSleepPlacement.offset),
+				       gbaSleepIrqHandler, sizeof(gbaSleepIrqHandler));
+
+				// Make the injected ARM code visible to the LGY/ARM7 side explicitly.
+				flushDCacheRange((void*)(LGY_ROM_LOC + gbaSleepPlacement.offset),
+				                 sizeof(gbaSleepIrqHandler));
+
+				gbaSleepHandlerGbaAddr = GBA_SLEEP_HANDLER_ROM_BASE + gbaSleepPlacement.offset;
+#ifndef NDEBUG
+				if(gbaSleepPlacement.kind == GBA_SLEEP_PLACE_ROM_PADDING)
+				{
+					ee_printf("GBA Sleep: IRQ handler @ %08lX ROM+%08lX pad=%02X run=%08lX+%08lX\n",
+					          (unsigned long)gbaSleepHandlerGbaAddr,
+					          (unsigned long)gbaSleepPlacement.offset,
+					          (unsigned)gbaSleepPlacement.fillByte,
+					          (unsigned long)gbaSleepPlacement.spanStart,
+					          (unsigned long)gbaSleepPlacement.spanSize);
+				}
+				else
+				{
+					ee_printf("GBA Sleep: IRQ handler @ %08lX ROM+%08lX source=open-bus-tail\n",
+					          (unsigned long)gbaSleepHandlerGbaAddr,
+					          (unsigned long)gbaSleepPlacement.offset);
+				}
+#endif
+			}
+			else
+			{
+				// Transparent fallback: normal BIOS IRQ path, Sleep/Wake disabled.
+				ee_puts("GBA Sleep: no validated IRQ handler location; Sleep/Wake disabled.");
+			}
 			free(romFilePath);
 
 			// Set audio output and volume.
 			CODEC_setAudioOutput(g_oafConfig.audioOut);
 			CODEC_setVolumeOverride(g_oafConfig.volume);
+
+			// Select the runtime GBA Sleep IRQ handler before ARM9 builds the BIOS overlay.
+			// ARM9 defaults to BIOS 0x128 and also resets to it after each prepare.
+			g_gbaSleepAvailable = false;
+			res = LGY_setGbaIrqHandlerAddress(gbaSleepHandlerGbaAddr);
+			if(res != RES_OK)
+			{
+				ee_puts("GBA Sleep: IRQ handler target rejected; using BIOS IRQ fallback.");
+				gbaSleepHandlerGbaAddr = GBA_SLEEP_BIOS_IRQ_HANDLER;
+			}
+			else if(gbaSleepHandlerGbaAddr != GBA_SLEEP_BIOS_IRQ_HANDLER)
+				g_gbaSleepAvailable = true;
 
 			// Prepare ARM9 for GBA mode + save loading.
 			res = LGY_prepareGbaMode(g_oafConfig.directBoot, saveType, filePath);
@@ -351,6 +634,11 @@ Result oafInitAndRun(void)
 	return res;
 }
 
+bool oafIsGbaSleepAvailable(void)
+{
+	return g_gbaSleepAvailable;
+}
+
 void oafUpdate(void)
 {
 	const u32 *const maps = g_oafConfig.buttonMaps;
@@ -371,6 +659,7 @@ void oafUpdate(void)
 
 void oafFinish(void)
 {
+	g_gbaSleepAvailable = false;
 	// frameReadyEvent deleted by this function.
 	OAF_videoExit();
 	g_frameReadyEvent = 0;

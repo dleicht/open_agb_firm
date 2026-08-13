@@ -19,6 +19,7 @@
 #include "oaf_error_codes.h"
 #include "fs.h"
 #include "arm11/open_agb_firm.h"
+#include "arm11/gba_sleep_lid.h"
 #include "drivers/gfx.h"
 #include "arm11/drivers/mcu.h"
 #include "arm11/console.h"
@@ -41,7 +42,11 @@ int main(void)
 		while(1)
 		{
 			hidScanInput();
-			if(hidGetExtraKeys(0) & (KEY_POWER_HELD | KEY_POWER)) break;
+			const u32 extraKeys = hidGetExtraKeys(KEY_SHELL);
+			if(extraKeys & (KEY_POWER_HELD | KEY_POWER)) break;
+
+			if(extraKeys & KEY_SHELL)
+				gbaSleepHandleLid();
 
 			oafUpdate();
 		}
