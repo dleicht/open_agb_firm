@@ -305,27 +305,28 @@ void gbaSleepHandleLid(void)
 	}
 
 
-	/*
-	 * Do not touch the framebuffer-backed console while the graphics domain is
-	 * asleep. VRAM/GPU access is safe again only after the cold resume.
-	 */
+#ifndef NDEBUG
+	/* Debug console output is only emitted after graphics access is safe. */
 	if(!deepGfxSleep)
 	{
 		ee_printf("GBA Sleep: ARM11 wakeups while lid closed: %lu (lightweight gfx sleep)\n",
 		          (unsigned long)arm11Wakeups);
 	}
+#endif
 
 	if(deepGfxSleep)
 	{
 		GFX_sleepAwakeCold();
 		OAF_videoResumeAfterGfxSleep();
 
-		/* The debug console is safe again only after the graphics cold resume. */
+#ifndef NDEBUG
+		/* Keep normal release wakes silent; report resume state in debug builds. */
 		if(pdnSleepReturned)
 			ee_printf("GBA Sleep: ARM11 PDN system sleep resumed successfully\n");
 		else
 			ee_printf("GBA Sleep: ARM11 wakeups while lid closed: %lu (GPU/VRAM off fallback)\n",
 			          (unsigned long)arm11Wakeups);
+#endif
 	}
 	else
 	{
@@ -350,7 +351,13 @@ void gbaSleepHandleLid(void)
 	lgy11->pad_sel = oldPadSel;
 
 	MCU_setPowerLedPattern(MCU_PWR_LED_AUTO);
+#ifndef NDEBUG
 	GFX_powerOnBacklight(GFX_BL_BOTH);
+#else
+	/* Keep the release-build bottom screen dark after every cold resume. */
+	GFX_setForceBlack(false, true);
+	GFX_powerOnBacklight(GFX_BL_TOP);
+#endif
 	LGYCAP_start(LGYCAP_DEV_TOP);
 	CODEC_wakeup();
 	CODEC_setVolumeOverride(g_oafConfig.volume);
@@ -368,6 +375,7 @@ void gbaSleepHandleLid(void)
 	                                          &powerAwakeAfter, &batteryBefore,
 	                                          &batteryAfter, arm11Wakeups,
 	                                          (deepGfxSleep ? &pdnWake : NULL));
+#ifndef NDEBUG
 	if(logRes == RES_OK)
 		ee_printf("Power-state log written: %s\n", POWER_STATE_LOG_PATH);
 	else
@@ -378,5 +386,8 @@ void gbaSleepHandleLid(void)
 	          (int)batteryBefore.temperature,
 	          batteryAfter.level, (unsigned long)batteryAfter.millivolts,
 	          (int)batteryAfter.temperature);
+#else
+	(void)logRes;
+#endif
 
 }

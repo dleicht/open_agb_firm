@@ -323,7 +323,9 @@ void arm11SuspendProbeReportPrevious(void)
 		return;
 
 	const char *const name = getProbeStageName(marker.stage);
+#ifndef NDEBUG
 	ee_printf("Previous ARM11 suspend state: %02X: %s\n", marker.stage, name);
+#endif
 
 	char line[128];
 	const int len = ee_snprintf(line, sizeof(line),

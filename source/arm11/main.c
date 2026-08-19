@@ -41,6 +41,12 @@ int main(void)
 
 	if(res == RES_OK && (res = oafInitAndRun()) == RES_OK)
 	{
+#ifdef NDEBUG
+		/* The bottom screen is only needed for the launcher and diagnostics. */
+		GFX_setForceBlack(false, true);
+		GFX_powerOffBacklight(GFX_BL_BOT);
+#endif
+
 		while(1)
 		{
 			hidScanInput();
