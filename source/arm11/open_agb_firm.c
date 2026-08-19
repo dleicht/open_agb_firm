@@ -50,6 +50,9 @@ static bool g_gbaSleepAvailable = false;
 #define GBA_SLEEP_EEPROM_RESERVED_OFF   0x01FFFF00u
 #define GBA_SLEEP_HANDLER_ALIGN         4u
 #define GBA_SLEEP_HANDLER_PAD_GUARD             0x40u
+#define GBA_SLEEP_HANDLER_FORCE_ENTRY_OFF       0x20u
+
+static u32 g_gbaSleepHandlerGbaAddr = GBA_SLEEP_BIOS_IRQ_HANDLER;
 
 typedef enum
 {
@@ -519,6 +522,9 @@ Result oafInitAndRun(void)
 			 *   L + Select -> real GBA STOP
 			 *   R + Select -> wake
 			 *
+			 * Automatic lid sleep temporarily redirects vector slot 0x14 to the
+			 * handler's shared sleep entry, so no GBA gameplay key is injected.
+			 *
 			 * The handler address is selected at runtime from validated ROM padding
 			 * or OAF's fake-open-bus tail. EEPROM offset 0x01FFFF00..0x01FFFFFF
 			 * is never used.
@@ -607,6 +613,8 @@ Result oafInitAndRun(void)
 			else if(gbaSleepHandlerGbaAddr != GBA_SLEEP_BIOS_IRQ_HANDLER)
 				g_gbaSleepAvailable = true;
 
+			g_gbaSleepHandlerGbaAddr = gbaSleepHandlerGbaAddr;
+
 			// Prepare ARM9 for GBA mode + save loading.
 			res = LGY_prepareGbaMode(g_oafConfig.directBoot, saveType, filePath);
 			if(res == RES_OK)
@@ -639,6 +647,15 @@ bool oafIsGbaSleepAvailable(void)
 	return g_gbaSleepAvailable;
 }
 
+Result oafSetGbaForcedSleepVector(const bool forced)
+{
+	if(!g_gbaSleepAvailable) return RES_INVALID_ARG;
+
+	const u32 target = g_gbaSleepHandlerGbaAddr +
+	                   (forced ? GBA_SLEEP_HANDLER_FORCE_ENTRY_OFF : 0u);
+	return LGY_setGbaIrqVectorAddress(target);
+}
+
 void oafUpdate(void)
 {
 	const u32 *const maps = g_oafConfig.buttonMaps;
@@ -660,6 +677,7 @@ void oafUpdate(void)
 void oafFinish(void)
 {
 	g_gbaSleepAvailable = false;
+	g_gbaSleepHandlerGbaAddr = GBA_SLEEP_BIOS_IRQ_HANDLER;
 	// frameReadyEvent deleted by this function.
 	OAF_videoExit();
 	g_frameReadyEvent = 0;

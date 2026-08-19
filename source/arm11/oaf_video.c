@@ -43,6 +43,20 @@
 
 
 static KHandle g_convFinishedEvent = 0;
+
+/*
+ * Core-1 teardown handshake for color-profile sleep. A private IPI wakes the
+ * IRQ-masked converter so it can clean its private D-cache and return to
+ * core1Standby() even if no further GBA capture IRQ arrives.
+ */
+volatile u32 g_oafColorConverterStopRequested = 0u;
+volatile u32 g_oafColorConverterStopped = 0u;
+
+/* Block new frame work while the graphics pipeline is being suspended. */
+static volatile bool g_gbaGfxSuspendRequested = false;
+static volatile bool g_gbaGfxBusy = false;
+static KHandle g_gbaGfxIdleEvent = 0;
+static bool g_gbaGpuInited = false;
 static const u32 g_topLcdCurveCorrect[73] =
 {
 	// Curve correction from 3DS top LCD gamma to 2.2 gamma for all channels.
@@ -358,6 +372,15 @@ static void gbaGfxHandler(void *args)
 		if(waitForEvent(event) != KRES_OK) break;
 		clearEvent(event);
 
+		/* Mark busy before testing the suspend gate to close the start-frame race. */
+		g_gbaGfxBusy = true;
+		if(g_gbaGfxSuspendRequested)
+		{
+			g_gbaGfxBusy = false;
+			if(g_gbaGfxIdleEvent != 0) signalEvent(g_gbaGfxIdleEvent, true);
+			continue;
+		}
+
 		// All measurements are the worst timings in ~30 seconds of runtime.
 		// Measured with timer prescaler 1.
 		// BGR8:
@@ -369,12 +392,11 @@ static void gbaGfxHandler(void *args)
 		// 240x160 no scaling:    ~188 µs (25300 ticks)
 		// 240x160 bilinear x1.5: ~407 µs (54619 ticks)
 		// 360x240 no scaling:    ~400 µs (53725 ticks)
-		static bool inited = false;
 		u32 listSize;
 		const u32 *list;
-		if(inited == false)
+		if(g_gbaGpuInited == false)
 		{
-			inited = true;
+			g_gbaGpuInited = true;
 
 			listSize = sizeof(gbaGpuInitList);
 			list = (u32*)gbaGpuInitList;
@@ -394,9 +416,146 @@ static void gbaGfxHandler(void *args)
 		// Trigger only if both are held and at least one is detected as newly pressed down.
 		if(hidKeysHeld() == (KEY_Y | KEY_SELECT) && hidKeysDown() != 0)
 			dumpFrameTex();
+
+		g_gbaGfxBusy = false;
+		if(g_gbaGfxSuspendRequested && g_gbaGfxIdleEvent != 0)
+			signalEvent(g_gbaGfxIdleEvent, true);
 	}
 
+	g_gbaGfxBusy = false;
+	if(g_gbaGfxIdleEvent != 0) signalEvent(g_gbaGfxIdleEvent, true);
 	taskExit();
+}
+
+static void waitForGbaGfxIdle(void)
+{
+	while(g_gbaGfxBusy)
+	{
+		if(g_gbaGfxIdleEvent != 0)
+		{
+			clearEvent(g_gbaGfxIdleEvent);
+			if(g_gbaGfxBusy) waitForEvent(g_gbaGfxIdleEvent);
+		}
+		else
+		{
+			__wfi();
+		}
+	}
+}
+
+static void bootColorConverter(void)
+{
+	g_oafColorConverterStopRequested = 0u;
+	g_oafColorConverterStopped = 0u;
+	__dsb();
+
+	/* Wait until core1Standby() is ready before starting the converter. */
+	__systemWaitCore1Standby();
+	__systemBootCore1((g_oafConfig.scaler < 2 ? convert160pFrameFast : convert240pFrameFast));
+}
+
+void OAF_videoSuspendForGfxSleep(void)
+{
+	/*
+	 * L+Select has already been injected when this function runs. Block new
+	 * Core-0 frame work, then return the color converter to core1Standby()
+	 * without depending on another captured GBA frame.
+	 */
+	g_gbaGfxSuspendRequested = true;
+
+	if(g_oafConfig.colorProfile > 0)
+	{
+		g_oafColorConverterStopped = 0u;
+		g_oafColorConverterStopRequested = 1u;
+		__dsb();
+	}
+
+	/* Stop new DREQs while Core 1 is being parked. */
+	LGYCAP_stop(LGYCAP_DEV_TOP);
+
+	if(g_oafConfig.colorProfile > 0)
+	{
+		/*
+		 * IPI14 is registered only on the converter core. If Core 1 is already in
+		 * WFI it wakes immediately; if it is still converting a chunk the IPI
+		 * remains pending and wakes the next WFI. The ASM stop path cleans its
+		 * complete private D-cache before returning to core1Standby().
+		 */
+		IRQ_softInterrupt(IRQ_IPI14, BIT(1));
+
+		while(g_oafColorConverterStopped == 0u)
+			__asm__ volatile("nop");
+
+		__systemWaitCore1Standby();
+
+		/* Do not carry the converter's last Core0 notification into PDN. */
+		if(g_convFinishedEvent != 0) clearEvent(g_convFinishedEvent);
+	}
+
+	/* Wait for any already in-flight P3D/PPF frame to finish. */
+	waitForGbaGfxIdle();
+
+	/* An in-flight screenshot path may have restarted capture before idling. */
+	LGYCAP_stop(LGYCAP_DEV_TOP);
+}
+
+static void loadBorderForUnscaledMode(void)
+{
+	if(g_oafConfig.scaler != 0)
+		return;
+
+	/*
+	 * scaler=none keeps the decorative border in the GPU render buffer.
+	 * Deep sleep powers VRAM down and the cold graphics resume rebuilds it,
+	 * so the border has to be copied back just like it is during video init.
+	 *
+	 * The visible top framebuffer is still unused at this point and is safe to
+	 * borrow as a temporary linear buffer for border.bgr.
+	 */
+	void *const borderBuf = GFX_getBuffer(GFX_LCD_TOP, GFX_SIDE_LEFT);
+	if(fsQuickRead("border.bgr", borderBuf, 400 * 240 * 3) == RES_OK)
+	{
+		GX_displayTransfer(borderBuf, PPF_DIM(240, 400), (u32*)GPU_RENDER_BUF_ADDR,
+		                   PPF_DIM(240, 400), PPF_O_FMT(GX_BGR8) |
+		                   PPF_I_FMT(GX_BGR8) | PPF_OUT_TILED);
+		GFX_waitForPPF();
+	}
+}
+
+void OAF_videoResumeAfterGfxSleep(void)
+{
+	/* Cold resume loses GPU state. Restore persistent unscaled-mode content first. */
+	loadBorderForUnscaledMode();
+
+	/* Replay the init list on the next captured frame. */
+	g_gbaGpuInited = false;
+
+	if(g_oafConfig.colorProfile > 0)
+	{
+		/*
+		 * Rebuild every color-profile-specific dependency instead of assuming it
+		 * survived PDN. The LUT lives in DSP RAM (0x1FF00000), so regenerating it
+		 * also removes RAM-retention from the wake contract.
+		 */
+		patchGbaGpuCmdList(g_oafConfig.scaler, true);
+		makeColorLut(&g_colorProfiles[g_oafConfig.colorProfile - 1]);
+
+		if(g_convFinishedEvent != 0) clearEvent(g_convFinishedEvent);
+		IRQ_registerIsr(IRQ_IPI15, 13, 0, convFinishedHandler);
+
+		/* Restore the one LGYCAP register that differs from colorProfile=none. */
+		LgyCap *const lgyCap = getLgyCapRegs(LGYCAP_DEV_TOP);
+		lgyCap->stat = LGYCAP_IRQ_MASK;
+		lgyCap->irq = LGYCAP_IRQ_DMA_REQ;
+
+		/* Recreate the converter while capture is still stopped. */
+		bootColorConverter();
+	}
+
+	/* GFX cold-resume resets the PDC color LUT to identity. Restore OAF gamma. */
+	adjustGammaTableForGba();
+
+	g_gbaGfxSuspendRequested = false;
 }
 
 static KHandle setupFrameCapture(const u8 scaler, const bool colorCorrectionEnabled)
@@ -472,7 +631,7 @@ KHandle OAF_videoInit(void)
 
 		// Register IPI handler and start core 1 for color conversion.
 		IRQ_registerIsr(IRQ_IPI15, 13, 0, convFinishedHandler);
-		__systemBootCore1((scaler < 2 ? convert160pFrameFast : convert240pFrameFast));
+		bootColorConverter();
 	}
 	else
 	{
@@ -484,24 +643,17 @@ KHandle OAF_videoInit(void)
 	}
 
 	// Start frame handler.
+	g_gbaGfxSuspendRequested = false;
+	g_gbaGfxBusy = false;
+	g_gbaGpuInited = false;
+	g_gbaGfxIdleEvent = createEvent(false);
 	createTask(0x800, 3, gbaGfxHandler, (void*)(colorProfile > 0 ? convFinishedEvent : frameReadyEvent));
 
 	// Adjust hardware gamma table.
 	adjustGammaTableForGba();
 
-	// Load border if any exists.
-	if(scaler == 0) // No borders for scaled modes.
-	{
-		// Abuse currently invisible frame buffer as temporary buffer.
-		void *const borderBuf = GFX_getBuffer(GFX_LCD_TOP, GFX_SIDE_LEFT);
-		if(fsQuickRead("border.bgr", borderBuf, 400 * 240 * 3) == RES_OK)
-		{
-			// Copy border in swizzled form to GPU render buffer.
-			GX_displayTransfer(borderBuf, PPF_DIM(240, 400), (u32*)GPU_RENDER_BUF_ADDR,
-			                   PPF_DIM(240, 400), PPF_O_FMT(GX_BGR8) | PPF_I_FMT(GX_BGR8) | PPF_OUT_TILED);
-			GFX_waitForPPF();
-		}
-	}
+	// Load the optional border used by scaler=none.
+	loadBorderForUnscaledMode();
 
 	return frameReadyEvent;
 }

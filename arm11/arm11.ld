@@ -150,6 +150,18 @@ SECTIONS
 	} : data
 	__bss_end__ = .;
 
+	/*
+	 * ARM11 suspend retention state.  This must survive the normal BSS clear
+	 * long enough for the early reset-entry probe to inspect it.
+	 */
+	.arm11_suspend_noinit ALIGN(32) (NOLOAD):
+	{
+		__arm11_suspend_noinit_start__ = .;
+		KEEP(*(.arm11_suspend_noinit))
+		. = ALIGN(32);
+		__arm11_suspend_noinit_end__ = .;
+	} : data
+
 	__end__ = ABSOLUTE(.) ;
 
 	/* ==================
