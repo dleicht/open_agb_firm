@@ -8,7 +8,6 @@ extern "C"
 {
 #endif
 
-void gbaSleepReportPreviousResumeTrace(void);
 void gbaSleepHandleLid(void);
 
 #ifdef __cplusplus

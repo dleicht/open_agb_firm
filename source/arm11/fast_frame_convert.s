@@ -139,9 +139,8 @@ BEGIN_ASM_FUNC convert160pFrameFast
 				wfi                                @ __waitForInterrupt();
 
 				/*
-				 * Check teardown before interpreting the wakeup as LGYCAP. This
-				 * keeps shutdown independent of any further GBA frame after the
-				 * unchanged 13a2 L+Select injection.
+				 * Check teardown before treating the wakeup as LGYCAP so shutdown
+				 * does not depend on another captured GBA frame.
 				 */
 				ldr  r6, =g_oafColorConverterStopRequested
 				ldr  r6, [r6]
@@ -301,9 +300,8 @@ BEGIN_ASM_FUNC convert240pFrameFast
 				wfi                                @ __waitForInterrupt();
 
 				/*
-				 * Check teardown before interpreting the wakeup as LGYCAP. This
-				 * keeps shutdown independent of any further GBA frame after the
-				 * unchanged 13a2 L+Select injection.
+				 * Check teardown before treating the wakeup as LGYCAP so shutdown
+				 * does not depend on another captured GBA frame.
 				 */
 				ldr  r6, =g_oafColorConverterStopRequested
 				ldr  r6, [r6]

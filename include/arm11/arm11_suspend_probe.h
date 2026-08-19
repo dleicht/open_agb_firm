@@ -22,15 +22,11 @@ typedef struct
 } Arm11SuspendWakeInfo;
 
 /*
- * Phase 12 experimental ARM11 system suspend.
+ * Enter ARM11 PDN system sleep with both active cores advertised as SCU
+ * DORMANT. On wake, restore the SCU/core state and return in the same Core-0
+ * execution context.
  *
- * Phase 11 established on real N3DS hardware that PDN sleep returns behind
- * WFI in the same Core-0 execution context when both active ARM11 cores are
- * advertised as SCU DORMANT.  This function now restores the SCU/core state
- * and returns to the caller so the proven 09f graphics cold-resume can run.
- *
- * false: a prerequisite was missing; caller should use the known-good WFI
- *        fallback.
+ * false: a prerequisite was unavailable; caller should use the WFI fallback.
  * true:  PDN sleep was entered and returned on wake.
  */
 bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *info);

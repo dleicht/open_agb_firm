@@ -1,10 +1,6 @@
 /*
- * Phase 11 ARM11 system-suspend semantics probe.
- *
- * Goal: determine whether a real 3DS PDN system-sleep wake resumes Core 0
- * behind WFI or restarts it through the ARM11 reset entry.
- *
- * This file intentionally does not attempt to restore CPU context yet.
+ * ARM11 PDN system-sleep coordination and retained wake-state diagnostics.
+ * Both active cores enter SCU DORMANT before the PDN sleep request.
  */
 #include "arm.h"
 #include "types.h"
@@ -22,7 +18,7 @@
 #include "arm11/drivers/pdn.h"
 #include "arm11/drivers/scu.h"
 
-#define ARM11_SUSPEND_COOKIE_MAGIC       0x53313150u /* "P11S" */
+#define ARM11_SUSPEND_COOKIE_MAGIC       0x53313150u /* Retained suspend cookie. */
 #define ARM11_SUSPEND_COOKIE_MAGIC_INV   (~ARM11_SUSPEND_COOKIE_MAGIC)
 #define ARM11_SUSPEND_PROBE_MCU_OFF      8u
 #define ARM11_SUSPEND_PROBE_LOG_PATH     OAF_WORK_DIR "/power_state.log"
@@ -71,7 +67,7 @@ static const char* getProbeStageName(const u8 stage)
 {
 	switch(stage)
 	{
-		case PROBE_MARK_ARMED:               return "PROBE_ARMED";
+		case PROBE_MARK_ARMED:               return "SUSPEND_ARMED";
 		case PROBE_MARK_VRAM_STATUS_OK:      return "VRAM_STATUS_OK";
 		case PROBE_MARK_CORE1_DORMANT_READY: return "CORE1_DORMANT_READY";
 		case PROBE_MARK_CORE0_SLEEP_ENTER:   return "CORE0_SLEEP_ENTER";
@@ -100,10 +96,10 @@ static void writeProbeMarker(const u8 stage)
 }
 
 /*
- * Only used by the early reset-entry probe before normal libn3ds startup.
- * It has no dependency on IRQs, mutexes, events or initialized BSS.
+ * Record an unexpected reset-entry wake before normal libn3ds startup. This
+ * path cannot depend on IRQs, events, mutexes or initialized BSS.
  */
-static void writeEarlyResumeMarkerAndLed(void)
+static void writeEarlyResumeMarker(void)
 {
 	static const u8 marker[4] =
 	{
@@ -122,14 +118,12 @@ static void writeEarlyResumeMarkerAndLed(void)
 	                          ARM11_SUSPEND_PROBE_MCU_OFF);
 	(void)I2C_writeRegArrayIntSafe(I2C_DEV_CTR_MCU, MCU_REG_FREE_RAM_DATA,
 	                               marker, sizeof(marker));
-	(void)I2C_writeRegIntSafe(I2C_DEV_CTR_MCU, MCU_REG_PWR_LED,
-	                          MCU_PWR_LED_FAST_BLUE);
 }
 
 /*
- * Called from start.s on Core 0 after a valid stack exists, but before BSS is
- * cleared.  A PDN wake reason is required as an additional guard so a later
- * manual hard reset does not turn a retained cookie into a false positive.
+ * Called on Core 0 after a valid stack exists but before BSS is cleared. A
+ * matching PDN wake reason prevents a later hard reset from reusing a stale
+ * retained cookie.
  */
 void arm11SuspendProbeEarlyResume(void)
 {
@@ -143,15 +137,15 @@ void arm11SuspendProbeEarlyResume(void)
 	if((pdn->wake_reason & (PDN_WAKE_SHELL_OPENED | PDN_WAKE_MCU)) == 0)
 		return;
 
-	/* One-shot: prevent a later manual reset from re-entering this probe. */
+	/* Prevent a later hard reset from reusing the retained wake cookie. */
 	cookie->armed = 0;
 	__dsb();
 
-	writeEarlyResumeMarkerAndLed();
+	writeEarlyResumeMarker();
 
 	/*
-	 * Positive result.  Deliberately stop here: no context restore exists yet.
-	 * FAST BLUE means Core 0 really reached the reset-entry resume hook.
+	 * A reset-entry wake cannot safely resume the suspended execution context,
+	 * so remain parked and preserve the marker for the next boot.
 	 */
 	while(1) __wfi();
 }
@@ -329,11 +323,11 @@ void arm11SuspendProbeReportPrevious(void)
 		return;
 
 	const char *const name = getProbeStageName(marker.stage);
-	ee_printf("Previous ARM11 suspend probe: %02X: %s\n", marker.stage, name);
+	ee_printf("Previous ARM11 suspend state: %02X: %s\n", marker.stage, name);
 
 	char line[128];
 	const int len = ee_snprintf(line, sizeof(line),
-	                            "Previous ARM11 suspend probe: %02X: %s\n",
+	                            "Previous ARM11 suspend state: %02X: %s\n",
 	                            marker.stage, name);
 	if(len > 0)
 	{

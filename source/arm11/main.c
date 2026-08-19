@@ -37,7 +37,6 @@ int main(void)
 	changeBacklight(0); // Apply backlight config.
 	consoleInit(GFX_LCD_BOT, NULL);
 	arm11SuspendProbeReportPrevious();
-	gbaSleepReportPreviousResumeTrace();
 	//CODEC_init();
 
 	if(res == RES_OK && (res = oafInitAndRun()) == RES_OK)

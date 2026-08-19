@@ -45,15 +45,14 @@
 static KHandle g_convFinishedEvent = 0;
 
 /*
- * Color-profile Core-1 teardown handshake for deep sleep. Core 0 can request
- * shutdown after the unchanged 13a2 L+Select injection; a private IPI wakes
- * the IRQ-masked converter so it can clean its private D-cache and return to
- * normal libn3ds core1Standby() even if no further GBA capture IRQ arrives.
+ * Core-1 teardown handshake for color-profile sleep. A private IPI wakes the
+ * IRQ-masked converter so it can clean its private D-cache and return to
+ * core1Standby() even if no further GBA capture IRQ arrives.
  */
 volatile u32 g_oafColorConverterStopRequested = 0u;
 volatile u32 g_oafColorConverterStopped = 0u;
 
-/* Experimental graphics-suspend handshake for lid sleep. */
+/* Block new frame work while the graphics pipeline is being suspended. */
 static volatile bool g_gbaGfxSuspendRequested = false;
 static volatile bool g_gbaGfxBusy = false;
 static KHandle g_gbaGfxIdleEvent = 0;
@@ -450,7 +449,7 @@ static void bootColorConverter(void)
 	g_oafColorConverterStopped = 0u;
 	__dsb();
 
-	/* Never race a returning Core-1 job against core1Standby() setup. */
+	/* Wait until core1Standby() is ready before starting the converter. */
 	__systemWaitCore1Standby();
 	__systemBootCore1((g_oafConfig.scaler < 2 ? convert160pFrameFast : convert240pFrameFast));
 }
@@ -458,13 +457,9 @@ static void bootColorConverter(void)
 void OAF_videoSuspendForGfxSleep(void)
 {
 	/*
-	 * Preserve the exact 13a2 lid-input ordering: this function is entered only
-	 * after L+Select has already been injected on the LGY HID path.
-	 *
-	 * Block future Core-0 frame work first. For color-profile mode, request the
-	 * Core-1 converter to leave its IRQ-masked WFI loop, then stop capture and
-	 * wake the worker with a private IPI14. This does not depend on another GBA
-	 * frame arriving after the SWI 03h trigger.
+	 * L+Select has already been injected when this function runs. Block new
+	 * Core-0 frame work, then return the color converter to core1Standby()
+	 * without depending on another captured GBA frame.
 	 */
 	g_gbaGfxSuspendRequested = true;
 
@@ -475,10 +470,7 @@ void OAF_videoSuspendForGfxSleep(void)
 		__dsb();
 	}
 
-	/*
-	 * This is the same point at which 13a2 stopped LGYCAP after injecting
-	 * L+Select. It also prevents any new DREQs while Core 1 is being parked.
-	 */
+	/* Stop new DREQs while Core 1 is being parked. */
 	LGYCAP_stop(LGYCAP_DEV_TOP);
 
 	if(g_oafConfig.colorProfile > 0)
@@ -556,10 +548,7 @@ void OAF_videoResumeAfterGfxSleep(void)
 		lgyCap->stat = LGYCAP_IRQ_MASK;
 		lgyCap->irq = LGYCAP_IRQ_DMA_REQ;
 
-		/*
-		 * The proven 13a2 DORMANT job has returned Core 1 to normal standby.
-		 * Recreate the converter while capture is still stopped.
-		 */
+		/* Recreate the converter while capture is still stopped. */
 		bootColorConverter();
 	}
 
