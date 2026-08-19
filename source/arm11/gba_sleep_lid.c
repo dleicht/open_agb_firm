@@ -32,7 +32,6 @@
 #include "arm11/drivers/scu.h"
 #include "arm11/drivers/timer.h"
 
-#define GBA_SLEEP_BUTTONS  0x0204u  // L + Select.
 #define GBA_WAKE_BUTTONS   0x0104u  // R + Select.
 #define POWER_STATE_LOG_PATH  OAF_WORK_DIR "/power_state.log"
 #define POWER_STATE_LOG_SIZE  8192u
@@ -205,9 +204,9 @@ void gbaSleepHandleLid(void)
 	const PowerStateSnapshot powerAwakeBefore = readPowerStateSnapshot();
 
 	/*
-	 * Use the deep graphics/PDN path for every video mode. Keep the L+Select
-	 * injection before video suspension; color-profile Core-1 teardown happens
-	 * later inside OAF_videoSuspendForGfxSleep().
+	 * Use the deep graphics/PDN path for every video mode. The GBA is placed in
+	 * STOP before presentation is suspended; color-profile Core-1 teardown is
+	 * handled later by OAF_videoSuspendForGfxSleep().
 	 */
 	const bool deepGfxSleep = true;
 
@@ -215,19 +214,50 @@ void gbaSleepHandleLid(void)
 
 	const u16 oldPadSel = lgy11->pad_sel;
 	const u16 oldPadVal = lgy11->pad_val;
-	const u16 injectedButtons =
-		GBA_SLEEP_BUTTONS | GBA_WAKE_BUTTONS;
 
 	/*
-	 * Lid close: inject the same L+Select combination that works manually.
-	 * The GBA Sleep IRQ handler then enters real GBA SWI 03h / STOP.
+	 * Automatic lid sleep redirects the ARM7 IRQ vector directly to the
+	 * handler's shared SWI 03h path. Leave the GBA input override untouched so
+	 * the running game sees no synthetic button transition. Manual L+Select
+	 * remains unchanged.
 	 */
-	lgy11->pad_sel = oldPadSel | injectedButtons;
-	LGY11_setInputState(GBA_SLEEP_BUTTONS);
+	bool gbaSleepConfirmed = (REG_HID_PADCNT != 0u);
+	if(!gbaSleepConfirmed)
+	{
+		REG_HID_PADCNT = 0;
+
+		const Result vectorRes = oafSetGbaForcedSleepVector(true);
+		if(vectorRes != RES_OK)
+		{
+			ee_printf("GBA Sleep: failed to redirect ARM7 IRQ vector: %08lX\n",
+			          (unsigned long)vectorRes);
+			return;
+		}
+
+		/*
+		 * IRQ_LGY_SLEEP mirrors the ARM7 wake KEYCNT into REG_HID_PADCNT. Wait
+		 * until the forced handler has actually entered GBA STOP. If the lid is
+		 * reopened first, cancel without exposing any synthetic GBA input.
+		 */
+		while(REG_HID_PADCNT == 0u && GPIO_read(GPIO_1_SHELL))
+			__wfi();
+
+		const Result restoreRes = oafSetGbaForcedSleepVector(false);
+		if(restoreRes != RES_OK)
+		{
+			ee_printf("GBA Sleep: failed to restore ARM7 IRQ vector: %08lX\n",
+			          (unsigned long)restoreRes);
+			return;
+		}
+
+		gbaSleepConfirmed = (REG_HID_PADCNT != 0u);
+	}
+
+	if(!gbaSleepConfirmed)
+		return;
 
 	/*
-	 * Suspend the N3DS presentation only after the GBA STOP trigger is injected.
-	 * The GBA STOP request is injected before presentation is suspended.
+	 * Suspend the N3DS presentation after the GBA STOP request is established.
 	 */
 	/*
 	 * Suspend the codec and I2S hardware instead of only muting it.
@@ -304,8 +334,9 @@ void gbaSleepHandleLid(void)
 	}
 
 	/*
-	 * Lid open: present R+Select first, then wake/ack LGY.
+	 * Lid open: select and present R+Select first, then wake/ack LGY.
 	 */
+	lgy11->pad_sel = oldPadSel | GBA_WAKE_BUTTONS;
 	LGY11_setInputState(GBA_WAKE_BUTTONS);
 	REG_HID_PADCNT = 0;
 	lgy11->sleep |= (u16)(BIT(0) | BIT(1));

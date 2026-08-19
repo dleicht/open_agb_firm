@@ -31,6 +31,7 @@ Result oafParseConfigEarly(void);
 void changeBacklight(s16 amount);
 Result oafInitAndRun(void);
 bool oafIsGbaSleepAvailable(void);
+Result oafSetGbaForcedSleepVector(bool forced);
 void oafUpdate(void);
 void oafFinish(void);
 
