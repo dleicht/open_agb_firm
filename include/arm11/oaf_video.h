@@ -23,3 +23,5 @@
 
 KHandle OAF_videoInit(void);
 void OAF_videoExit(void);
+void OAF_videoSuspendForGfxSleep(void);
+void OAF_videoResumeAfterGfxSleep(void);
