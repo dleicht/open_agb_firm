@@ -5,6 +5,18 @@ Please find the original documentation there.
 ## tl;dr
 `Native GBA SWI 03h sleep using dynamically injected ARM7 IRQ code, combined with real 3DS PDN system sleep, runtime IRQ-vector lid triggering, Core 1/color-profile support, border restoration, and reliable full-system wake.`
 
+## Battery life
+> [!TIP]
+> Since this uses real device sleep it gives you way longer battery life!
+
+Here are the results of my latest 10 hours sleep test. This was done running [Goodboy Galaxy](https://goodboygalaxy.itch.io/goodboy-galaxy-gba), but the game shouldn't make much of a difference:
+
+| Fork | Drain in %/h | Estimated runtime |
+| ---- | ------------ | ----------------- |
+| profi200 | 13 %/h | ~ 8 hours |
+| dleicht | 1,5 %/h | ~ 66 hours |
+
+
 ## Full changelog
 
 ### Dynamic On-the-Fly GBA IRQ Sleep-Handler Injection
