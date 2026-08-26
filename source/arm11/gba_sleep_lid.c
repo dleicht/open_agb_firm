@@ -1,13 +1,13 @@
 /*
- * Automatic lid integration for universal GBA Sleep/Wake support.
+ * Automatic system sleep-input integration for universal GBA Sleep/Wake.
  *
- * Lid Close:
- *   GBA L+Select -> GBA Sleep IRQ handler -> real SWI 03h / STOP
- *   then N3DS audio/capture/backlights off + sleep power LED
+ * Sleep input active (lid closed or original 2DS sleep switch engaged):
+ *   ARM7 IRQ redirect -> GBA Sleep IRQ handler -> real SWI 03h / STOP
+ *   then 3DS audio/capture/backlights off + sleep power LED
  *
- * Lid Open:
+ * Sleep input released (lid opened or original 2DS sleep switch released):
  *   GBA R+Select + LGY wake/ack -> GBA Sleep IRQ handler resumes
- *   then N3DS presentation is restored
+ *   then 3DS presentation is restored
  *
  * This module does not modify or replace the GBA Sleep IRQ handler.
  */
@@ -33,6 +33,7 @@
 #include "arm11/drivers/timer.h"
 
 #define GBA_WAKE_BUTTONS   0x0104u  // R + Select.
+#ifndef NDEBUG
 #define POWER_STATE_LOG_PATH  OAF_WORK_DIR "/power_state.log"
 #define POWER_STATE_LOG_SIZE  8192u
 
@@ -152,7 +153,7 @@ static Result appendPowerStateLog(const PowerStateSnapshot *const awakeBefore,
 	off += ee_snprintf(logBuf + off, sizeof(logBuf) - off,
 	                   "\n=== GBA Sleep Power-State Dump ===\n");
 	off += ee_snprintf(logBuf + off, sizeof(logBuf) - off,
-	                   "ARM11 wakeups while lid closed: %lu\n",
+	                   "ARM11 wakeups while system sleep input active: %lu\n",
 	                   (unsigned long)arm11Wakeups);
 	if(pdnWake != NULL)
 	{
@@ -193,15 +194,18 @@ static Result appendPowerStateLog(const PowerStateSnapshot *const awakeBefore,
 	const Result closeRes = fClose(file);
 	return (res != RES_OK ? res : closeRes);
 }
+#endif
 
-void gbaSleepHandleLid(void)
+void gbaSleepHandleSystemSleepInput(void)
 {
 	if(!oafIsGbaSleepAvailable())
 		return;
 
+#ifndef NDEBUG
 	/* Measure under the normal fully-awake load before entering sleep. */
 	const BatterySnapshot batteryBefore = readBatterySnapshot();
 	const PowerStateSnapshot powerAwakeBefore = readPowerStateSnapshot();
+#endif
 
 	/*
 	 * Use the deep graphics/PDN path for every video mode. The GBA is placed in
@@ -216,7 +220,7 @@ void gbaSleepHandleLid(void)
 	const u16 oldPadVal = lgy11->pad_val;
 
 	/*
-	 * Automatic lid sleep redirects the ARM7 IRQ vector directly to the
+	 * Automatic system sleep input redirects the ARM7 IRQ vector directly to the
 	 * handler's shared SWI 03h path. Leave the GBA input override untouched so
 	 * the running game sees no synthetic button transition. Manual L+Select
 	 * remains unchanged.
@@ -236,8 +240,8 @@ void gbaSleepHandleLid(void)
 
 		/*
 		 * IRQ_LGY_SLEEP mirrors the ARM7 wake KEYCNT into REG_HID_PADCNT. Wait
-		 * until the forced handler has actually entered GBA STOP. If the lid is
-		 * reopened first, cancel without exposing any synthetic GBA input.
+		 * until the forced handler has actually entered GBA STOP. If the system sleep input is
+		 * released first, cancel without exposing any synthetic GBA input.
 		 */
 		while(REG_HID_PADCNT == 0u && GPIO_read(GPIO_1_SHELL))
 			__wfi();
@@ -280,27 +284,38 @@ void gbaSleepHandleLid(void)
 	}
 	MCU_setPowerLedPattern(MCU_PWR_LED_SLEEP);
 
+#ifndef NDEBUG
 	/* Snapshot the final low-power configuration immediately before WFI. */
 	const PowerStateSnapshot powerSleepReady = readPowerStateSnapshot();
-
 	u32 arm11Wakeups = 0;
+#endif
 
 	/*
-	 * Enter PDN system sleep. If a prerequisite is unavailable, use the lid WFI
-	 * fallback. A successful wake restores both active SCU core states and
+	 * Enter PDN system sleep. If a prerequisite is unavailable, use the system sleep-input
+	 * WFI fallback. A successful wake restores both active SCU core states and
 	 * returns in the same Core-0 context with the raw wake state recorded.
 	 */
+#ifndef NDEBUG
 	Arm11SuspendWakeInfo pdnWake = {0};
+#endif
 	bool pdnSleepReturned = false;
 	if(deepGfxSleep)
+	{
+#ifndef NDEBUG
 		pdnSleepReturned = arm11SuspendProbeEnter(&pdnWake);
+#else
+		pdnSleepReturned = arm11SuspendProbeEnter(NULL);
+#endif
+	}
 
 	if(!pdnSleepReturned)
 	{
 		while(GPIO_read(GPIO_1_SHELL))
 		{
 			__wfi();
+#ifndef NDEBUG
 			arm11Wakeups++;
+#endif
 		}
 	}
 
@@ -309,7 +324,7 @@ void gbaSleepHandleLid(void)
 	/* Debug console output is only emitted after graphics access is safe. */
 	if(!deepGfxSleep)
 	{
-		ee_printf("GBA Sleep: ARM11 wakeups while lid closed: %lu (lightweight gfx sleep)\n",
+		ee_printf("GBA Sleep: ARM11 wakeups while system sleep input active: %lu (lightweight gfx sleep)\n",
 		          (unsigned long)arm11Wakeups);
 	}
 #endif
@@ -324,7 +339,7 @@ void gbaSleepHandleLid(void)
 		if(pdnSleepReturned)
 			ee_printf("GBA Sleep: ARM11 PDN system sleep resumed successfully\n");
 		else
-			ee_printf("GBA Sleep: ARM11 wakeups while lid closed: %lu (GPU/VRAM off fallback)\n",
+			ee_printf("GBA Sleep: ARM11 wakeups while system sleep input active: %lu (GPU/VRAM off fallback)\n",
 			          (unsigned long)arm11Wakeups);
 #endif
 	}
@@ -335,7 +350,7 @@ void gbaSleepHandleLid(void)
 	}
 
 	/*
-	 * Lid open: select and present R+Select first, then wake/ack LGY.
+	 * System sleep input released: present R+Select first, then wake/ack LGY.
 	 */
 	lgy11->pad_sel = oldPadSel | GBA_WAKE_BUTTONS;
 	LGY11_setInputState(GBA_WAKE_BUTTONS);
@@ -354,18 +369,22 @@ void gbaSleepHandleLid(void)
 #ifndef NDEBUG
 	GFX_powerOnBacklight(GFX_BL_BOTH);
 #else
-	/* Keep the release-build bottom screen dark after every cold resume. */
+	/* Keep the logical bottom screen dark after every cold resume. */
 	GFX_setForceBlack(false, true);
-	GFX_powerOnBacklight(GFX_BL_TOP);
+	if(MCU_getSystemModel() == SYS_MODEL_2DS)
+		GFX_powerOnBacklight(GFX_BL_BOTH);
+	else
+		GFX_powerOnBacklight(GFX_BL_TOP);
 #endif
 	LGYCAP_start(LGYCAP_DEV_TOP);
 	CODEC_wakeup();
 	CODEC_setVolumeOverride(g_oafConfig.volume);
 
+#ifndef NDEBUG
 	/*
 	 * Measure again under the restored fully-awake load. The short settling
 	 * delay keeps the voltage comparison from being dominated by resume
-	 * transients. The same delay is used by the upstream baseline build.
+	 * transients.
 	 */
 	TIMER_sleepMs(250);
 	const BatterySnapshot batteryAfter = readBatterySnapshot();
@@ -375,7 +394,6 @@ void gbaSleepHandleLid(void)
 	                                          &powerAwakeAfter, &batteryBefore,
 	                                          &batteryAfter, arm11Wakeups,
 	                                          (deepGfxSleep ? &pdnWake : NULL));
-#ifndef NDEBUG
 	if(logRes == RES_OK)
 		ee_printf("Power-state log written: %s\n", POWER_STATE_LOG_PATH);
 	else
@@ -386,8 +404,6 @@ void gbaSleepHandleLid(void)
 	          (int)batteryBefore.temperature,
 	          batteryAfter.level, (unsigned long)batteryAfter.millivolts,
 	          (int)batteryAfter.temperature);
-#else
-	(void)logRes;
 #endif
 
 }

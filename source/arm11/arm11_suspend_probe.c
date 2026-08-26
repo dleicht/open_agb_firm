@@ -5,23 +5,33 @@
 #include "arm.h"
 #include "types.h"
 #include "system.h"
+#ifndef NDEBUG
 #include "fs.h"
 #include "arm11/fmt.h"
 #include "arm11/config.h"
 #include "arm11/open_agb_firm.h"
+#endif
 #include "arm11/arm11_suspend_probe.h"
 #include "arm11/drivers/gpio.h"
+#ifndef NDEBUG
 #include "arm11/drivers/i2c.h"
+#endif
 #include "arm11/drivers/interrupt.h"
 #include "arm11/drivers/mcu.h"
+#ifndef NDEBUG
 #include "arm11/drivers/mcu_regmap.h"
+#endif
 #include "arm11/drivers/pdn.h"
 #include "arm11/drivers/scu.h"
 
 #define ARM11_SUSPEND_COOKIE_MAGIC       0x53313150u /* Retained suspend cookie. */
 #define ARM11_SUSPEND_COOKIE_MAGIC_INV   (~ARM11_SUSPEND_COOKIE_MAGIC)
-#define ARM11_SUSPEND_PROBE_MCU_OFF      8u
+
+#ifndef NDEBUG
+/* MCU free-RAM bytes 196..199 are used for debug breadcrumbs only. */
+#define ARM11_SUSPEND_PROBE_MCU_OFF      196u
 #define ARM11_SUSPEND_PROBE_LOG_PATH     OAF_WORK_DIR "/power_state.log"
+#endif
 
 #define PROBE_MARK_ARMED                 0xA0u
 #define PROBE_MARK_VRAM_STATUS_OK        0xA1u
@@ -52,6 +62,7 @@ typedef struct
 __attribute__((section(".arm11_suspend_noinit"), aligned(32), used))
 static volatile Arm11SuspendProbeCookie g_arm11SuspendProbeCookie;
 
+#ifndef NDEBUG
 typedef struct
 {
 	u8 magic0;
@@ -119,6 +130,16 @@ static void writeEarlyResumeMarker(void)
 	(void)I2C_writeRegArrayIntSafe(I2C_DEV_CTR_MCU, MCU_REG_FREE_RAM_DATA,
 	                               marker, sizeof(marker));
 }
+#else
+static inline void writeProbeMarker(const u8 stage)
+{
+	(void)stage;
+}
+
+static inline void writeEarlyResumeMarker(void)
+{
+}
+#endif
 
 /*
  * Called on Core 0 after a valid stack exists but before BSS is cleared. A
@@ -203,14 +224,19 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 {
 	Pdn *const pdn = getPdnRegs();
 	Scu *const scu = getScuRegs();
+	const u32 wakeEnableBefore = pdn->wake_enable;
 
+#ifndef NDEBUG
 	if(info != NULL)
 	{
 		*info = (Arm11SuspendWakeInfo){0};
 		info->pdnCntBeforeSleep = pdn->cnt;
-		info->wakeEnableBefore = pdn->wake_enable;
+		info->wakeEnableBefore = wakeEnableBefore;
 		info->scuCpuStatBeforeSleep = scu->cpu_stat;
 	}
+#else
+	(void)info;
+#endif
 
 	/*
 	 * GFX_sleep() ran before this function. Treat bit15 as a hardware status,
@@ -231,12 +257,14 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 	if(staleReason != 0)
 		pdn->wake_reason = staleReason;
 	pdn->wake_enable = PDN_WAKE_SHELL_OPENED | PDN_WAKE_MCU;
+#ifndef NDEBUG
 	if(info != NULL) info->wakeEnableDuringSleep = pdn->wake_enable;
+#endif
 
 	if(!MCU_writeReg(MCU_REG_SYS_PWR, BIT(4)))
 	{
 		writeProbeMarker(PROBE_MARK_MCU_PREPARE_FAILED);
-		pdn->wake_enable = (info != NULL ? info->wakeEnableBefore : 0u);
+		pdn->wake_enable = wakeEnableBefore;
 		return false;
 	}
 
@@ -271,6 +299,7 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 	__isb();
 	__wfi();
 
+#ifndef NDEBUG
 	/* Capture the raw wake state before acknowledging or restoring anything. */
 	if(info != NULL)
 	{
@@ -280,6 +309,7 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 		info->scuCpuStatAtWake = scu->cpu_stat;
 		info->shellOpenAfterWake = (GPIO_read(GPIO_1_SHELL) ? 0u : 1u);
 	}
+#endif
 	writeProbeMarker(PROBE_MARK_SAME_CONTEXT_RETURN);
 
 	/* Core 0 is executing again, so stop advertising it as DORMANT first. */
@@ -298,12 +328,14 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 		__asm__ volatile("nop");
 	writeProbeMarker(PROBE_MARK_CORE1_NORMAL);
 
+#ifndef NDEBUG
 	if(info != NULL) info->scuCpuStatAfterRestore = scu->cpu_stat;
+#endif
 
 	/* Acknowledge the raw wake reason and restore the caller's wake mask. */
 	const u32 wakeReason = pdn->wake_reason;
 	if(wakeReason != 0u) pdn->wake_reason = wakeReason;
-	pdn->wake_enable = (info != NULL ? info->wakeEnableBefore : 0u);
+	pdn->wake_enable = wakeEnableBefore;
 
 	g_arm11SuspendProbeCookie.armed = 0u;
 	writeProbeMarker(PROBE_MARK_PDN_WAKE_ACKED);
@@ -312,6 +344,7 @@ bool arm11SuspendProbeEnter(Arm11SuspendWakeInfo *const info)
 
 void arm11SuspendProbeReportPrevious(void)
 {
+#ifndef NDEBUG
 	Arm11SuspendProbeMarker marker = {0};
 	if(!MCU_getFreeRamData(ARM11_SUSPEND_PROBE_MCU_OFF,
 	                       (u8*)&marker, sizeof(marker)))
@@ -347,4 +380,5 @@ void arm11SuspendProbeReportPrevious(void)
 	const Arm11SuspendProbeMarker clear = {0};
 	(void)MCU_setFreeRamData(ARM11_SUSPEND_PROBE_MCU_OFF,
 	                         (const u8*)&clear, sizeof(clear));
+#endif
 }

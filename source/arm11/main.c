@@ -36,17 +36,13 @@ int main(void)
 	GFX_init(GFX_BGR8, GFX_BGR565, GFX_TOP_2D);
 	changeBacklight(0); // Apply backlight config.
 	consoleInit(GFX_LCD_BOT, NULL);
+#ifndef NDEBUG
 	arm11SuspendProbeReportPrevious();
+#endif
 	//CODEC_init();
 
 	if(res == RES_OK && (res = oafInitAndRun()) == RES_OK)
 	{
-#ifdef NDEBUG
-		/* The bottom screen is only needed for the launcher and diagnostics. */
-		GFX_setForceBlack(false, true);
-		GFX_powerOffBacklight(GFX_BL_BOT);
-#endif
-
 		while(1)
 		{
 			hidScanInput();
@@ -54,7 +50,7 @@ int main(void)
 			if(extraKeys & (KEY_POWER_HELD | KEY_POWER)) break;
 
 			if(extraKeys & KEY_SHELL)
-				gbaSleepHandleLid();
+				gbaSleepHandleSystemSleepInput();
 
 			oafUpdate();
 		}
