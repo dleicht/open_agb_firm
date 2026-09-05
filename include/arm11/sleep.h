@@ -1,6 +1,8 @@
+#pragma once
+
 /*
  *   This file is part of open_agb_firm
- *   Copyright (C) 2024 profi200
+ *   Copyright (C) 2026 Dominik Leicht
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -16,12 +18,13 @@
  *   along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "types.h"
-#include "kernel.h"
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
+void OAF_sleep(void);
 
-
-KHandle OAF_videoInit(void);
-void OAF_videoExit(void);
-void OAF_videoSuspend(void);
-void OAF_videoResume(void);
+#ifdef __cplusplus
+} // extern "C"
+#endif
